@@ -7,24 +7,27 @@ import { AnswerSection } from '@/components/answer-section'
 export async function researcher(
   uiStream: ReturnType<typeof createStreamableUI>,
   streamableText: ReturnType<typeof createStreamableValue<string>>,
-  messages: CoreMessage[],
-  useSpecificModel?: boolean
+  messages: CoreMessage[]
 ) {
   let fullResponse = ''
   let hasError = false
+  let finishReason = ''
 
   // Transform the messages if using Ollama provider
   let processedMessages = messages
   const useOllamaProvider = !!(
     process.env.OLLAMA_MODEL && process.env.OLLAMA_BASE_URL
   )
+  const useAnthropicProvider = !!process.env.ANTHROPIC_API_KEY
   if (useOllamaProvider) {
     processedMessages = transformToolMessages(messages)
   }
   const includeToolResponses = messages.some(message => message.role === 'tool')
   const useSubModel = useOllamaProvider && includeToolResponses
 
-  const answerSection = <AnswerSection result={streamableText.value} />
+  const streamableAnswer = createStreamableValue<string>('')
+  const answerSection = <AnswerSection result={streamableAnswer.value} />
+
   const currentDate = new Date().toLocaleString()
   const result = await streamText({
     model: getModel(useSubModel),
@@ -38,12 +41,18 @@ export async function researcher(
     The number must always match the order of the search results.
     The retrieve tool can only be used with URLs provided by the user. URLs from search results cannot be used.
     If it is a domain instead of a URL, specify it in the include_domains of the search tool.
-    Please match the language of the response to the user's language. Current date and time: ${currentDate}`,
+    Please match the language of the response to the user's language. Current date and time: ${currentDate}
+    `,
     messages: processedMessages,
     tools: getTools({
       uiStream,
       fullResponse
-    })
+    }),
+    onFinish: async event => {
+      finishReason = event.finishReason
+      fullResponse = event.text
+      streamableAnswer.done()
+    }
   }).catch(err => {
     hasError = true
     fullResponse = 'Error: ' + err.message
@@ -55,8 +64,10 @@ export async function researcher(
     return { result, fullResponse, hasError, toolResponses: [] }
   }
 
-  // Remove the spinner
-  uiStream.update(null)
+  const hasToolResult = messages.some(message => message.role === 'tool')
+  if (!useAnthropicProvider || hasToolResult) {
+    uiStream.append(answerSection)
+  }
 
   // Process the response
   const toolCalls: ToolCallPart[] = []
@@ -65,24 +76,18 @@ export async function researcher(
     switch (delta.type) {
       case 'text-delta':
         if (delta.textDelta) {
-          // If the first text delta is available, add a UI section
-          if (fullResponse.length === 0 && delta.textDelta.length > 0) {
-            // Update the UI
-            uiStream.update(answerSection)
-          }
-
           fullResponse += delta.textDelta
-          streamableText.update(fullResponse)
+          if (useAnthropicProvider && !hasToolResult) {
+            streamableText.update(fullResponse)
+          } else {
+            streamableAnswer.update(fullResponse)
+          }
         }
         break
       case 'tool-call':
         toolCalls.push(delta)
         break
       case 'tool-result':
-        // Append the answer section if the specific model is not used
-        if (!useSpecificModel && toolResponses.length === 0 && delta.result) {
-          uiStream.append(answerSection)
-        }
         if (!delta.result) {
           hasError = true
         }
@@ -105,5 +110,5 @@ export async function researcher(
     messages.push({ role: 'tool', content: toolResponses })
   }
 
-  return { result, fullResponse, hasError, toolResponses }
+  return { result, fullResponse, hasError, toolResponses, finishReason }
 }

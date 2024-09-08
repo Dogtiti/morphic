@@ -6,7 +6,7 @@ import {
   getAIState,
   getMutableAIState
 } from 'ai/rsc'
-import { CoreMessage, nanoid, ToolResultPart } from 'ai'
+import { CoreMessage, generateId, ToolResultPart } from 'ai'
 import { Spinner } from '@/components/ui/spinner'
 import { Section } from '@/components/section'
 import { FollowupPanel } from '@/components/followup-panel'
@@ -52,8 +52,8 @@ async function submit(
       return { role, content } as CoreMessage
     })
 
-  // goupeiId is used to group the messages for collapse
-  const groupeId = nanoid()
+  // groupId is used to group the messages for collapse
+  const groupId = generateId()
 
   const useSpecificAPI = process.env.USE_SPECIFIC_API_FOR_WRITER === 'true'
   const useOllamaProvider = !!(
@@ -87,7 +87,7 @@ async function submit(
       messages: [
         ...aiState.get().messages,
         {
-          id: nanoid(),
+          id: generateId(),
           role: 'user',
           content,
           type
@@ -101,6 +101,9 @@ async function submit(
   }
 
   async function processEvents() {
+    // Show the spinner
+    uiStream.append(<Spinner />)
+
     let action = { object: { next: 'proceed' } }
     // If the user skips the task, we proceed to the search
     if (!skip) action = (await taskManager(messages)) ?? action
@@ -116,7 +119,7 @@ async function submit(
         messages: [
           ...aiState.get().messages,
           {
-            id: nanoid(),
+            id: generateId(),
             role: 'assistant',
             content: `inquiry: ${inquiry?.question}`,
             type: 'inquiry'
@@ -131,25 +134,33 @@ async function submit(
 
     //  Generate the answer
     let answer = ''
+    let stopReason = ''
     let toolOutputs: ToolResultPart[] = []
     let errorOccurred = false
+
     const streamText = createStreamableValue<string>()
-    uiStream.update(<Spinner />)
+
+    // If ANTHROPIC_API_KEY is set, update the UI with the answer
+    // If not, update the UI with a div
+    if (process.env.ANTHROPIC_API_KEY) {
+      uiStream.update(
+        <AnswerSection result={streamText.value} hasHeader={false} />
+      )
+    } else {
+      uiStream.update(<div />)
+    }
 
     // If useSpecificAPI is enabled, only function calls will be made
     // If not using a tool, this model generates the answer
     while (
       useSpecificAPI
-        ? toolOutputs.length === 0 && answer.length === 0
-        : answer.length === 0 && !errorOccurred
+        ? toolOutputs.length === 0 && answer.length === 0 && !errorOccurred
+        : (stopReason !== 'stop' || answer.length === 0) && !errorOccurred
     ) {
       // Search the web and generate the answer
-      const { fullResponse, hasError, toolResponses } = await researcher(
-        uiStream,
-        streamText,
-        messages,
-        useSpecificAPI
-      )
+      const { fullResponse, hasError, toolResponses, finishReason } =
+        await researcher(uiStream, streamText, messages)
+      stopReason = finishReason || ''
       answer = fullResponse
       toolOutputs = toolResponses
       errorOccurred = hasError
@@ -161,7 +172,7 @@ async function submit(
             messages: [
               ...aiState.get().messages,
               {
-                id: groupeId,
+                id: groupId,
                 role: 'tool',
                 content: JSON.stringify(output.result),
                 name: output.toolName,
@@ -178,13 +189,13 @@ async function submit(
       // modify the messages to be used by the specific model
       const modifiedMessages = transformToolMessages(messages)
       const latestMessages = modifiedMessages.slice(maxMessages * -1)
-      const { response, hasError } = await writer(
-        uiStream,
-        streamText,
-        latestMessages
-      )
+      const { response, hasError } = await writer(uiStream, latestMessages)
       answer = response
       errorOccurred = hasError
+      messages.push({
+        role: 'assistant',
+        content: answer
+      })
     }
 
     if (!errorOccurred) {
@@ -207,7 +218,7 @@ async function submit(
         messages: [
           ...aiState.get().messages,
           {
-            id: groupeId,
+            id: groupId,
             role: 'assistant',
             content: answer,
             type: 'answer'
@@ -229,13 +240,13 @@ async function submit(
         messages: [
           ...aiState.get().messages,
           {
-            id: groupeId,
+            id: groupId,
             role: 'assistant',
             content: JSON.stringify(relatedQueries),
             type: 'related'
           },
           {
-            id: groupeId,
+            id: groupId,
             role: 'assistant',
             content: 'followup',
             type: 'followup'
@@ -259,7 +270,7 @@ async function submit(
   processEvents()
 
   return {
-    id: nanoid(),
+    id: generateId(),
     isGenerating: isGenerating.value,
     component: uiStream.value,
     isCollapsed: isCollapsed.value
@@ -280,7 +291,7 @@ export type UIState = {
 }[]
 
 const initialAIState: AIState = {
-  chatId: nanoid(),
+  chatId: generateId(),
   messages: []
 }
 
@@ -325,7 +336,7 @@ export const AI = createAI<AIState, UIState>({
     const updatedMessages: AIMessage[] = [
       ...messages,
       {
-        id: nanoid(),
+        id: generateId(),
         role: 'assistant',
         content: `end`,
         type: 'end'
@@ -347,7 +358,13 @@ export const AI = createAI<AIState, UIState>({
 export const getUIStateFromAIState = (aiState: Chat) => {
   const chatId = aiState.chatId
   const isSharePage = aiState.isSharePage
-  return aiState.messages
+
+    // Ensure messages is an array of plain objects
+    const messages = Array.isArray(aiState.messages) 
+    ? aiState.messages.map(msg => ({...msg})) 
+    : [];
+
+  return messages
     .map((message, index) => {
       const { role, content, id, type, name } = message
 
@@ -397,9 +414,7 @@ export const getUIStateFromAIState = (aiState: Chat) => {
               return {
                 id,
                 component: (
-                  <Section title="Related" separator={true}>
-                    <SearchRelated relatedQueries={relatedQueries.value} />
-                  </Section>
+                  <SearchRelated relatedQueries={relatedQueries.value} />
                 )
               }
             case 'followup':
